@@ -1,0 +1,12 @@
+[package]
+name = "nomad-system-watcher"
+version = "0.1.0"
+authors = ["mlcruz1 <mlcruz@inf.ufrgs.br>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-std = {version = "1.8.0", features =["attributes", "tokio02", "unstable"] }
+async-log-watcher = { git = "https://github.com/mobiltracker/rs-async-log-watcher", branch= "main" }
+rand = "0.8.1"
