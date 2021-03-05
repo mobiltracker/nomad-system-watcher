@@ -1,32 +1,40 @@
 #![allow(dead_code)]
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+};
 
-use async_log_watcher::{LogWatcher, LogWatcherSignal};
-use async_std::channel::Sender;
-
-static NOMAD_DATA_DIR: &str = r"/opt/nomad";
+// static NOMAD_DATA_DIR: &str = r"/opt/nomad";
 
 struct OutputMeta {
     index: usize,
 }
 
-#[derive(Debug)]
-struct Task {
-    pub task_name: String,
-    path: PathBuf,
-    file_watcher: LogWatcher,
-    file_watcher_channel: Option<Sender<LogWatcherSignal>>,
+#[derive(Debug, Clone)]
+struct TaskLogFile {
+    pub path: PathBuf,
 }
 
-impl Task {
-    async fn new(path: PathBuf) -> Self {
-        let file_watcher = LogWatcher::new(&path);
+impl TaskLogFile {
+    pub fn new(path: PathBuf) -> Self {
+        TaskLogFile { path }
+    }
+}
 
+#[derive(Debug)]
+struct NomadTask {
+    pub task_name: OsString,
+    path: PathBuf,
+    pub logs: Vec<TaskLogFile>,
+}
+
+impl NomadTask {
+    fn new(name: &OsStr, dir_path: PathBuf) -> Self {
         Self {
-            task_name: path.to_str().unwrap().to_owned(),
-            path,
-            file_watcher,
-            file_watcher_channel: None,
+            task_name: name.to_os_string(),
+            logs: vec![],
+            path: dir_path,
         }
     }
 }
@@ -35,27 +43,67 @@ impl Task {
 struct AllocationDirectory {
     alloc_id: String,
     path: PathBuf,
-    tasks: Vec<Task>,
+    tasks: HashMap<OsString, NomadTask>,
 }
 
 impl AllocationDirectory {
-    pub async fn new(alloc_id: &str, path: PathBuf) -> Result<Self, std::io::Error> {
-        let dirs = std::fs::read_dir(&path)?;
-        let mut tasks = Vec::new();
+    pub async fn new(alloc_id: &str, alloc_dir_path: PathBuf) -> Result<Self, std::io::Error> {
+        let dir = std::fs::read_dir(&alloc_dir_path)?;
 
-        for dir in dirs {
-            let dir = dir.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        let mut tasks: HashMap<OsString, NomadTask> = HashMap::new();
 
-            if dir.file_type().unwrap().is_file() && !(dir.path().extension().unwrap() == "fifo") {
-                tasks.push(Task::new(dir.path()).await);
+        for dir in dir {
+            let dir_entry =
+                dir.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+
+            if dir_entry.file_type().unwrap().is_file()
+                && !(dir_entry.path().extension().unwrap() == "fifo")
+            {
+                let name = &dir_entry.file_name();
+                let name = AllocationDirectory::normalize_task_name(name.as_os_str()).ok_or_else(
+                    || std::io::Error::new(std::io::ErrorKind::NotFound, "Missing file"),
+                )?;
+
+                tasks
+                    .entry(name.to_owned())
+                    .and_modify(|task| {
+                        task.logs.push(TaskLogFile::new(dir_entry.path()));
+                    })
+                    .or_insert_with(|| {
+                        let mut task = NomadTask::new(&name, alloc_dir_path.clone());
+                        task.logs.push(TaskLogFile::new(dir_entry.path()));
+                        task
+                    });
             }
         }
 
         Ok(Self {
             alloc_id: alloc_id.to_owned(),
             tasks,
-            path,
+            path: alloc_dir_path,
         })
+    }
+
+    fn diff_state(&self) {}
+
+    fn normalize_task_name(path: &OsStr) -> Option<OsString> {
+        let path = PathBuf::from(path);
+        if let Some(ext) = path.extension() {
+            if ext == "stderr" || ext == "stdout" {
+                return path.file_stem().map(|p| p.to_owned());
+            }
+
+            let ext_as_number = ext.to_str().map(|s| s.parse::<i32>().ok()).flatten();
+
+            if let Some(_) = ext_as_number {
+                return path
+                    .file_stem()
+                    .map(|p| Path::new(p).file_stem().map(|p| p.to_os_string()))
+                    .flatten();
+            }
+        }
+
+        return None;
     }
 }
 
@@ -92,13 +140,30 @@ impl NomadSystem {
 mod tests {
     use std::{
         collections::hash_map::DefaultHasher,
+        ffi::OsString,
         hash::{Hash, Hasher},
         path::Path,
+        str::FromStr,
     };
 
     use rand::Rng;
 
-    use crate::NomadSystem;
+    use crate::{AllocationDirectory, NomadSystem};
+
+    #[test]
+    fn normalize_task_name() {
+        let task_name_1 = "foobar.stdout";
+        let task_name_2 = "foobar.stdout.1";
+        let task_name_3 = "foobar.stdout.2";
+        let task_name_4 = "foobar.stderr";
+
+        vec![task_name_1, task_name_2, task_name_3, task_name_4]
+            .into_iter()
+            .map(|f| {
+                AllocationDirectory::normalize_task_name(&OsString::from_str(f).unwrap()).unwrap()
+            })
+            .for_each(|p| assert_eq!("foobar", p));
+    }
 
     #[async_std::test]
     async fn start_system() {
@@ -111,11 +176,12 @@ mod tests {
         for (idx, dir_allocs) in allocs.chunks(10).enumerate() {
             let dir = &dirs[idx];
             let alloc_dir = system.allocations.get(dir).unwrap();
-            let mut system_tasks = alloc_dir
+
+            let mut task_names = alloc_dir
                 .tasks
                 .iter()
                 .map(|t| {
-                    let task_path = Path::new(&t.task_name);
+                    let task_path = Path::new(&t.1.task_name);
                     task_path
                         .file_name()
                         .unwrap()
@@ -126,15 +192,37 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            let mut expected = dir_allocs
+            task_names.sort();
+            let mut sorted_allocs = dir_allocs.to_vec();
+            sorted_allocs.sort();
+            // Task groups ok
+            assert_eq!(sorted_allocs, task_names);
+
+            let mut nomad_tasks_log_groups = alloc_dir
+                .tasks
                 .iter()
-                .flat_map(|s| vec![format!("{}.stderr", s), format!("{}.stdout", s)])
+                .map(|i| i.1)
+                .flat_map(|t| t.logs.clone())
+                .map(|t| t.path.file_name().unwrap().to_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+
+            let mut expected_log_groups = dir_allocs
+                .iter()
+                .flat_map(|s| {
+                    vec![
+                        format!("{}.stdout", s),
+                        format!("{}.stdout.1", s),
+                        format!("{}.stdout.2", s),
+                        format!("{}.stderr", s),
+                        format!("{}.stderr.1", s),
+                    ]
+                })
                 .collect::<Vec<String>>();
 
-            system_tasks.sort();
-            expected.sort();
+            nomad_tasks_log_groups.sort();
+            expected_log_groups.sort();
 
-            assert_eq!(expected, system_tasks);
+            assert_eq!(expected_log_groups, nomad_tasks_log_groups);
         }
     }
 
@@ -171,12 +259,18 @@ mod tests {
             let file_name = rand_string();
             collected.push(file_name.clone());
             let stdout = format!("{}.stdout", file_name);
+            let stdout_1 = format!("{}.stdout.1", file_name);
+            let stdout_2 = format!("{}.stdout.2", file_name);
             let stderr = format!("{}.stderr", file_name);
+            let stderr_1 = format!("{}.stderr.1", file_name);
             let stdout_fifo = format!("{}.stdout.fifo", file_name);
             let stderr_fifo = format!("{}.stderr.fifo", file_name);
 
             std::fs::File::create(Path::new(&full_path).join(stdout)).unwrap();
+            std::fs::File::create(Path::new(&full_path).join(stdout_1)).unwrap();
+            std::fs::File::create(Path::new(&full_path).join(stdout_2)).unwrap();
             std::fs::File::create(Path::new(&full_path).join(stderr)).unwrap();
+            std::fs::File::create(Path::new(&full_path).join(stderr_1)).unwrap();
             std::fs::File::create(Path::new(&full_path).join(stdout_fifo)).unwrap();
             std::fs::File::create(Path::new(&full_path).join(stderr_fifo)).unwrap();
         }
